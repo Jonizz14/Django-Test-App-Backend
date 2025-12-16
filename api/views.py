@@ -807,3 +807,4 @@ class StarPackageViewSet(viewsets.ModelViewSet):
         # Only allow authenticated users to create sessions
         serializer.save(student=self.request.user)
 
+
