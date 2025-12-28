@@ -1,5 +1,5 @@
 from rest_framework import serializers
-from .models import User, Test, Question, TestAttempt, Feedback, TestSession, Pricing, StarPackage, Gift, StudentGift
+from .models import User, Test, Question, TestAttempt, Feedback, TestSession, Pricing, StarPackage, ContactMessage
 
 class UserSerializer(serializers.ModelSerializer):
     password = serializers.CharField(write_only=True, required=False)
@@ -18,8 +18,10 @@ class UserSerializer(serializers.ModelSerializer):
                   'total_tests_taken', 'average_score', 'completed_subjects', 'stars',
                   'is_premium', 'premium_granted_date', 'premium_expiry_date', 'premium_plan', 'premium_cost', 'premium_type', 'premium_balance',
                   'profile_photo', 'profile_photo_url', 'profile_status', 'premium_emoji_count',
-                  'background_gradient', 'selected_emojis', 'display_gift', 'premium_info',
-                  'hide_premium_from_others', 'hide_premium_from_self']
+                  'background_gradient', 'selected_emojis', 'premium_info',
+                  'hide_premium_from_others', 'hide_premium_from_self',
+                  'admin_premium_plan', 'admin_premium_pending', 'admin_premium_approved', 'admin_premium_granted_date', 'admin_premium_expiry_date', 'admin_premium_cost',
+                  'organization']
         read_only_fields = ['id', 'created_at', 'last_login', 'display_id']
 
     def get_profile_photo_url(self, obj):
@@ -40,7 +42,15 @@ class UserSerializer(serializers.ModelSerializer):
         if User.objects.filter(username=username).exists():
             raise serializers.ValidationError({"username": "A user with this username already exists."})
 
-        password = validated_data.pop('password')
+        # Handle password - if not provided, generate one
+        password = validated_data.pop('password', None)
+        if not password:
+            # Generate a random password for new users
+            import secrets
+            import string
+            alphabet = string.ascii_letters + string.digits
+            password = ''.join(secrets.choice(alphabet) for i in range(12))
+
         user = super().create(validated_data)
         user.set_password(password)
         user.save()
@@ -210,46 +220,15 @@ class StarPackageSerializer(serializers.ModelSerializer):
             return f"{obj.discount_percentage}% Chegirma"
         return ""
 
-class GiftSerializer(serializers.ModelSerializer):
-    image_url = serializers.SerializerMethodField()
-    rarity_display = serializers.CharField(source='get_rarity_display', read_only=True)
-
+class ContactMessageSerializer(serializers.ModelSerializer):
+    subject_name = serializers.CharField(source='get_subject_display', read_only=True)
+    status_name = serializers.CharField(source='get_status_display', read_only=True)
+    replied_by_name = serializers.CharField(source='replied_by.username', read_only=True)
+    
     class Meta:
-        model = Gift
-        fields = ['id', 'name', 'description', 'image', 'image_url', 'star_cost', 'rarity', 'rarity_display', 'gift_count', 'is_active', 'created_at', 'updated_at']
-        read_only_fields = ['id', 'created_at', 'updated_at', 'image_url', 'rarity_display']
+        model = ContactMessage
+        fields = ['id', 'name', 'email', 'phone', 'subject', 'subject_name', 'message', 
+                  'status', 'status_name', 'created_at', 'updated_at', 'replied_at', 
+                  'admin_reply', 'replied_by', 'replied_by_name']
+        read_only_fields = ['id', 'created_at', 'updated_at', 'replied_at', 'replied_by']
 
-    def get_image_url(self, obj):
-        if obj.image:
-            request = self.context.get('request')
-            if request:
-                return request.build_absolute_uri(obj.image.url)
-            else:
-                return obj.image.url
-        return None
-
-class StudentGiftSerializer(serializers.ModelSerializer):
-    gift_name = serializers.CharField(source='gift.name', read_only=True)
-    gift_image_url = serializers.SerializerMethodField()
-    gift_rarity = serializers.CharField(source='gift.rarity', read_only=True)
-    gift_rarity_display = serializers.CharField(source='gift.get_rarity_display', read_only=True)
-    student_name = serializers.CharField(source='student.name', read_only=True)
-    gift_number = serializers.SerializerMethodField()
-
-    class Meta:
-        model = StudentGift
-        fields = ['id', 'student', 'student_name', 'gift', 'gift_name', 'gift_image_url', 'gift_rarity', 'gift_rarity_display', 'gift_number', 'purchased_at', 'is_placed', 'placement_position']
-        read_only_fields = ['id', 'purchased_at', 'gift_name', 'gift_image_url', 'gift_rarity', 'gift_rarity_display', 'student_name', 'gift_number']
-
-    def get_gift_image_url(self, obj):
-        if obj.gift.image:
-            request = self.context.get('request')
-            if request:
-                return request.build_absolute_uri(obj.gift.image.url)
-            else:
-                return obj.gift.image.url
-        return None
-
-    def get_gift_number(self, obj):
-        # Get the count of StudentGift objects created before this one
-        return StudentGift.objects.filter(purchased_at__lt=obj.purchased_at).count() + 1

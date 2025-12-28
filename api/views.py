@@ -1,3 +1,4 @@
+import time
 from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
@@ -6,13 +7,54 @@ from rest_framework_simplejwt.tokens import RefreshToken
 from django.contrib.auth import authenticate
 from django.utils import timezone
 from django.db import models
-from .models import User, Test, Question, TestAttempt, Feedback, TestSession, Pricing, StarPackage, Gift, StudentGift
-from .serializers import UserSerializer, TestSerializer, QuestionSerializer, TestAttemptSerializer, FeedbackSerializer, TestSessionSerializer, PricingSerializer, StarPackageSerializer, GiftSerializer, StudentGiftSerializer
+from .models import User, Test, Question, TestAttempt, Feedback, TestSession, Pricing, StarPackage, ContactMessage
+from .serializers import UserSerializer, TestSerializer, QuestionSerializer, TestAttemptSerializer, FeedbackSerializer, TestSessionSerializer, PricingSerializer, StarPackageSerializer
 
 class UserViewSet(viewsets.ModelViewSet):
     queryset = User.objects.all()
     serializer_class = UserSerializer
     permission_classes = [AllowAny]
+
+    def get_queryset(self):
+        queryset = User.objects.all()
+
+        # Apply admin isolation for admin users
+        if self.request.user.is_authenticated and self.request.user.role in ['admin', 'head_admin']:
+            if self.request.user.role == 'head_admin':
+                # Head admin can see all users
+                pass
+            else:
+                # Regular admin can only see users they created
+                queryset = queryset.filter(
+                    models.Q(created_by_admin=self.request.user) |
+                    models.Q(id=self.request.user.id)  # Can see themselves
+                )
+
+        # Apply teacher isolation - teachers can only see students created by their admin
+        elif self.request.user.is_authenticated and self.request.user.role == 'teacher':
+            if self.request.user.created_by_admin:
+                # Teacher can only see students created by their admin
+                queryset = queryset.filter(
+                    models.Q(created_by_admin=self.request.user.created_by_admin) |
+                    models.Q(id=self.request.user.id)  # Can see themselves
+                )
+            else:
+                # If teacher has no admin, only see themselves
+                queryset = queryset.filter(id=self.request.user.id)
+
+        # Apply student isolation - students can only see users created by their admin
+        elif self.request.user.is_authenticated and self.request.user.role == 'student':
+            if self.request.user.created_by_admin:
+                # Student can only see users created by their admin
+                queryset = queryset.filter(
+                    models.Q(created_by_admin=self.request.user.created_by_admin) |
+                    models.Q(id=self.request.user.id)  # Can see themselves
+                )
+            else:
+                # If student has no admin, only see themselves
+                queryset = queryset.filter(id=self.request.user.id)
+
+        return queryset
 
     def update(self, request, *args, **kwargs):
         # Allow partial updates for PUT requests too
@@ -23,31 +65,84 @@ class UserViewSet(viewsets.ModelViewSet):
         return Response(serializer.data)
 
     def create(self, request, *args, **kwargs):
-        serializer = self.get_serializer(data=request.data)
+        # Check limits for free plan admins
+        if request.user.is_authenticated and request.user.role == 'admin' and not request.user.is_premium:
+            role = request.data.get('role')
+            if role == 'student':
+                # Free plan: max 10 students
+                student_count = User.objects.filter(created_by_admin=request.user, role='student').count()
+                if student_count >= 10:
+                    return Response({'error': 'Bepul tarifda maksimum 10 ta o\'quvchi yaratish mumkin'}, status=status.HTTP_400_BAD_REQUEST)
+            elif role == 'teacher':
+                # Free plan: max 5 teachers
+                teacher_count = User.objects.filter(created_by_admin=request.user, role='teacher').count()
+                if teacher_count >= 5:
+                    return Response({'error': 'Bepul tarifda maksimum 5 ta o\'qituvchi yaratish mumkin'}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Generate password and username if not provided
+        data = request.data.copy()
+        if 'password' not in data or not data['password']:
+            # Use a temporary password, will be changed to display_id later
+            data['password'] = 'temp_password'
+
+        if 'username' not in data or not data['username']:
+            data['username'] = f"temp_{User.objects.count() + 1}"
+
+        print(f"Creating user with data: {data}")  # Debug logging
+
+        serializer = self.get_serializer(data=data)
         if serializer.is_valid():
             user = serializer.save()
-            return Response(UserSerializer(user).data, status=status.HTTP_201_CREATED)
+            print(f"User created: {user.username}, display_id: {user.display_id}, password: {data['password']}")  # Debug logging
+
+            # Set created_by_admin if the creator is an admin
+            if request.user.is_authenticated and request.user.role in ['admin', 'head_admin']:
+                user.created_by_admin = request.user if request.user.role == 'admin' else None
+                # Force regeneration of display_id with admin prefix
+                user.display_id = ''
+                user.username = f"temp_{user.id}"
+                user.save()
+                print(f"Set created_by_admin to: {user.created_by_admin}")  # Debug logging
+
+            # Set password after all user data is finalized
+            if user.role == 'admin' and 'password' in data and data['password'] and data['password'] != 'temp_password':
+                user.set_password(data['password'])
+            else:
+                # Set password to display_id for easy login
+                user.set_password(user.display_id)
+            user.save()
+
+            # Return user data with appropriate password for frontend
+            user_data = UserSerializer(user).data
+            if user.role == 'admin' and 'password' in data and data['password'] and data['password'] != 'temp_password':
+                user_data['generated_password'] = data['password']
+            else:
+                user_data['generated_password'] = user.display_id
+            return Response(user_data, status=status.HTTP_201_CREATED)
+        print(f"Serializer errors: {serializer.errors}")  # Debug logging
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
     @action(detail=False, methods=['post'])
     def login(self, request):
         username = request.data.get('username')
         password = request.data.get('password')
-        
+
         if not username or not password:
             return Response({'error': 'Username and password are required'}, status=status.HTTP_400_BAD_REQUEST)
-        
+
         user = None
-        if '@' in username:
-            user = authenticate(username=username, password=password)
-        else:
+        # First try to authenticate directly with username
+        user = authenticate(username=username, password=password)
+
+        # If that fails, try to find by display_id and authenticate with the actual username
+        if not user:
             try:
                 user_obj = User.objects.filter(display_id=username).first()
                 if user_obj:
                     user = authenticate(username=user_obj.username, password=password)
             except User.DoesNotExist:
                 user = None
-        
+
         if user:
             user.last_login = timezone.now()
             user.save()
@@ -61,11 +156,31 @@ class UserViewSet(viewsets.ModelViewSet):
 
     @action(detail=False, methods=['post'])
     def register(self, request):
-        serializer = self.get_serializer(data=request.data)
+        data = request.data.copy()
+
+        # For admin registration, set role to admin and handle organization
+        if data.get('role') == 'admin':
+            data['role'] = 'admin'
+            # Organization is already in the data
+
+        serializer = self.get_serializer(data=data)
         if serializer.is_valid():
             user = serializer.save()
-            user.set_password(request.data['password'])
+            # Use the provided password for admin registration
+            user.set_password(data['password'])
+
             user.save()
+
+            # For admin registration, don't return tokens - they need to choose a plan first
+            if data.get('role') == 'admin':
+                user_data = UserSerializer(user).data
+                user_data['generated_password'] = data['password']  # Use provided password
+                return Response({
+                    'user': user_data,
+                    'message': 'Admin ro\'yxatdan o\'tdi. Tarifni tanlash kerak.'
+                }, status=status.HTTP_201_CREATED)
+
+            # For other roles, return tokens
             refresh = RefreshToken.for_user(user)
             return Response({
                 'refresh': str(refresh),
@@ -73,6 +188,110 @@ class UserViewSet(viewsets.ModelViewSet):
                 'user': UserSerializer(user).data
             }, status=status.HTTP_201_CREATED)
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=False, methods=['post'], permission_classes=[IsAuthenticated])
+    def select_plan(self, request):
+        """Allow admin to select a pricing plan"""
+        if request.user.role != 'admin':
+            return Response({'error': 'Only admins can select plans'}, status=status.HTTP_403_FORBIDDEN)
+
+        plan_type = request.data.get('plan_type')
+        if not plan_type:
+            return Response({'error': 'plan_type is required'}, status=status.HTTP_400_BAD_REQUEST)
+
+        user = request.user
+
+        if plan_type == 'free':
+            # Free plan - no premium features, immediately approved
+            user.is_premium = False
+            user.admin_premium_plan = 'free'
+            user.admin_premium_pending = False
+            user.admin_premium_approved = True
+            user.admin_premium_granted_date = timezone.now()
+            user.admin_premium_cost = 0
+            user.save()
+        elif plan_type in ['basic', 'premium']:
+            # Paid plans - set as pending approval
+            user.admin_premium_plan = plan_type
+            user.admin_premium_pending = True
+            user.admin_premium_approved = False
+            user.is_premium = False  # Not premium until approved
+            if plan_type == 'basic':
+                user.admin_premium_cost = 9.99
+            elif plan_type == 'premium':
+                user.admin_premium_cost = 19.99
+            user.save()
+
+            # Send notification to head admin
+            self._send_admin_plan_notification(user, plan_type)
+        else:
+            return Response({'error': 'Invalid plan type'}, status=status.HTTP_400_BAD_REQUEST)
+
+        return Response({
+            'message': f'{plan_type} plan selected successfully',
+            'user': UserSerializer(user).data
+        })
+
+    @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated])
+    def approve_plan(self, request, pk=None):
+        """Head admin approves a pending admin premium plan"""
+        if request.user.role != 'head_admin':
+            return Response({'error': 'Only head admin can approve plans'}, status=status.HTTP_403_FORBIDDEN)
+
+        user = self.get_object()
+        if user.role != 'admin':
+            return Response({'error': 'Can only approve admin plans'}, status=status.HTTP_400_BAD_REQUEST)
+
+        if not user.admin_premium_pending:
+            return Response({'error': 'No pending plan to approve'}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Approve the plan
+        user.admin_premium_pending = False
+        user.admin_premium_approved = True
+        user.is_premium = True
+        user.admin_premium_granted_date = timezone.now()
+        user.save()
+
+        serializer = UserSerializer(user)
+        return Response({
+            'message': f'{user.admin_premium_plan} plan approved for {user.name}',
+            'user': serializer.data
+        })
+    
+    def _send_admin_plan_notification(self, admin_user, plan_type):
+        """Send notification to head admin when an admin selects a plan"""
+        try:
+            # Get all head admins
+            head_admins = User.objects.filter(role='head_admin')
+            
+            for head_admin in head_admins:
+                # Create notification data
+                notification_data = {
+                    'id': f'admin-plan-{admin_user.id}-{int(time.time())}',
+                    'type': 'admin_plan_selection',
+                    'title': 'Yangi Admin Tarif Tanladi',
+                    'message': f"Admin {admin_user.name} ({admin_user.email}) {plan_type} tarifini tanladi. Tasdiqlash kerak.",
+                    'adminId': admin_user.id,
+                    'adminName': admin_user.name,
+                    'adminEmail': admin_user.email,
+                    'planType': plan_type,
+                    'organization': admin_user.organization or 'Noma\'lum',
+                    'createdAt': timezone.now().isoformat(),
+                    'isRead': False
+                }
+                
+                # In a real application, you would save this to database
+                # For now, we'll log it and could potentially use WebSocket or other real-time notification system
+                print(f"Notification sent to head admin {head_admin.name}: {notification_data['message']}")
+                
+                # TODO: In production, you would:
+                # 1. Save notification to database
+                # 2. Send real-time notification via WebSocket
+                # 3. Send email notification if needed
+                
+        except Exception as e:
+            print(f"Error sending admin plan notification: {e}")
+            # Don't fail the main operation if notification fails
 
 
 
@@ -256,6 +475,48 @@ class UserViewSet(viewsets.ModelViewSet):
             'message': 'Premium status revoked successfully'
         })
 
+    @action(detail=True, methods=['patch'], permission_classes=[IsAuthenticated])
+    def delete_profile_data(self, request, pk=None):
+        """Delete profile picture and status for a specific student"""
+        user = self.get_object()
+        
+        # Check if the request contains the expected data
+        delete_profile_photo = request.data.get('delete_profile_photo', False)
+        delete_profile_status = request.data.get('delete_profile_status', False)
+        
+        if not (delete_profile_photo or delete_profile_status):
+            return Response({'error': 'At least one deletion flag must be true'}, status=status.HTTP_400_BAD_REQUEST)
+        
+        # Delete profile picture if requested
+        if delete_profile_photo:
+            if user.profile_photo:
+                # Delete the file from filesystem
+                import os
+                from django.conf import settings
+                if user.profile_photo.path and os.path.exists(user.profile_photo.path):
+                    try:
+                        os.remove(user.profile_photo.path)
+                    except Exception as e:
+                        print(f"Error deleting profile photo file: {e}")
+                user.profile_photo = None
+                user.profile_photo_url = None
+        
+        # Delete profile status if requested
+        if delete_profile_status:
+            user.profile_status = None
+        
+        user.save()
+        
+        serializer = UserSerializer(user)
+        return Response({
+            'user': serializer.data,
+            'message': 'Profile data deleted successfully',
+            'deleted': {
+                'profile_photo': delete_profile_photo,
+                'profile_status': delete_profile_status
+            }
+        })
+
 class TestViewSet(viewsets.ModelViewSet):
     queryset = Test.objects.all()
     serializer_class = TestSerializer
@@ -273,6 +534,31 @@ class TestViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         queryset = Test.objects.all()
+
+        # Apply admin isolation
+        if self.request.user.is_authenticated and self.request.user.role in ['admin', 'head_admin']:
+            if self.request.user.role == 'head_admin':
+                # Head admin can see all tests
+                pass
+            else:
+                # Regular admin can only see tests created by users they created
+                queryset = queryset.filter(
+                    models.Q(teacher__created_by_admin=self.request.user) |
+                    models.Q(teacher=self.request.user)  # Can see their own tests
+                )
+
+        # Apply student isolation - students can only see tests from teachers created by their admin
+        elif self.request.user.is_authenticated and self.request.user.role == 'student':
+            if self.request.user.created_by_admin:
+                # Student can only see tests from teachers created by their admin
+                queryset = queryset.filter(
+                    models.Q(teacher__created_by_admin=self.request.user.created_by_admin) |
+                    models.Q(teacher=self.request.user.created_by_admin)  # Admin's own tests
+                )
+            else:
+                # If student has no admin, don't show any tests
+                queryset = queryset.none()
+
         subject = self.request.query_params.get('subject', None)
         teacher = self.request.query_params.get('teacher', None)
         if subject:
@@ -280,7 +566,7 @@ class TestViewSet(viewsets.ModelViewSet):
         if teacher:
             queryset = queryset.filter(teacher=teacher)  # Fixed: use teacher instead of teacher_id
 
-        # Filter tests for students based on their class_group
+        # Filter tests for students based on their class_group (additional filtering)
         if self.request.user.role == 'student':
             # For students, only show tests that are specifically assigned to their class
             class_group = self.request.user.class_group
@@ -341,10 +627,40 @@ class TestAttemptViewSet(viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated]
 
     def perform_create(self, serializer):
+        test = serializer.validated_data['test']
+
+        # Check if student can access this test (same admin isolation)
+        if self.request.user.created_by_admin and test.teacher.created_by_admin != self.request.user.created_by_admin:
+            from rest_framework.exceptions import PermissionDenied
+            raise PermissionDenied("Siz faqat o'z adminingizning testlarida qatnasha olasiz")
+
         serializer.save(student=self.request.user)
 
     def get_queryset(self):
         queryset = TestAttempt.objects.all()
+
+        # Apply admin isolation - regular admins can only see attempts from their students
+        if self.request.user.is_authenticated and self.request.user.role == 'admin':
+            queryset = queryset.filter(
+                models.Q(student__created_by_admin=self.request.user) |
+                models.Q(test__teacher__created_by_admin=self.request.user) |
+                models.Q(test__teacher=self.request.user)  # Can see attempts on their own tests
+            )
+        
+        # Apply student isolation - students can only see their own attempts
+        elif self.request.user.is_authenticated and self.request.user.role == 'student':
+            queryset = queryset.filter(student=self.request.user)
+
+        # Apply teacher isolation - teachers can only see attempts from their students
+        elif self.request.user.is_authenticated and self.request.user.role == 'teacher':
+            if self.request.user.created_by_admin:
+                queryset = queryset.filter(
+                    models.Q(student__created_by_admin=self.request.user.created_by_admin) |
+                    models.Q(test__teacher=self.request.user)  # Teacher can see attempts on their tests
+                )
+            else:
+                queryset = queryset.filter(test__teacher=self.request.user)
+
         student = self.request.query_params.get('student', None)
         test = self.request.query_params.get('test', None)
         if student:
@@ -358,6 +674,33 @@ class FeedbackViewSet(viewsets.ModelViewSet):
     serializer_class = FeedbackSerializer
     permission_classes = [IsAuthenticated]
 
+    def get_queryset(self):
+        queryset = Feedback.objects.all()
+
+        # Apply admin isolation - regular admins can only see feedback from their students
+        if self.request.user.is_authenticated and self.request.user.role == 'admin':
+            queryset = queryset.filter(
+                models.Q(attempt__student__created_by_admin=self.request.user) |
+                models.Q(attempt__test__teacher__created_by_admin=self.request.user) |
+                models.Q(attempt__test__teacher=self.request.user)  # Can see feedback on their own tests
+            )
+        
+        # Apply teacher isolation - teachers can only see feedback from their students
+        elif self.request.user.is_authenticated and self.request.user.role == 'teacher':
+            if self.request.user.created_by_admin:
+                queryset = queryset.filter(
+                    models.Q(attempt__student__created_by_admin=self.request.user.created_by_admin) |
+                    models.Q(attempt__test__teacher=self.request.user)  # Teacher can see feedback on their tests
+                )
+            else:
+                queryset = queryset.filter(attempt__test__teacher=self.request.user)
+        
+        # Students can only see their own feedback
+        elif self.request.user.is_authenticated and self.request.user.role == 'student':
+            queryset = queryset.filter(attempt__student=self.request.user)
+
+        return queryset
+
 class TestSessionViewSet(viewsets.ModelViewSet):
     queryset = TestSession.objects.all()
     serializer_class = TestSessionSerializer
@@ -365,18 +708,41 @@ class TestSessionViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         queryset = TestSession.objects.all()
+
+        # Apply admin isolation - regular admins can only see sessions from their students
+        if self.request.user.is_authenticated and self.request.user.role == 'admin':
+            queryset = queryset.filter(
+                models.Q(student__created_by_admin=self.request.user) |
+                models.Q(test__teacher__created_by_admin=self.request.user) |
+                models.Q(test__teacher=self.request.user)  # Can see sessions on their own tests
+            )
+        
+        # Apply student isolation - students can only see their own sessions
+        elif self.request.user.is_authenticated and self.request.user.role == 'student':
+            queryset = queryset.filter(student=self.request.user)
+
+        # Apply teacher isolation - teachers can only see sessions from their students
+        elif self.request.user.is_authenticated and self.request.user.role == 'teacher':
+            if self.request.user.created_by_admin:
+                queryset = queryset.filter(
+                    models.Q(student__created_by_admin=self.request.user.created_by_admin) |
+                    models.Q(test__teacher=self.request.user)  # Teacher can see sessions on their tests
+                )
+            else:
+                queryset = queryset.filter(test__teacher=self.request.user)
+
         student = self.request.query_params.get('student', None)
         test = self.request.query_params.get('test', None)
         session_id = self.request.query_params.get('session_id', None)
         active_only = self.request.query_params.get('active_only', None)
-        
+
         if student:
             queryset = queryset.filter(student_id=student)
         if test:
             queryset = queryset.filter(test_id=test)
         if session_id:
             queryset = queryset.filter(session_id=session_id)
-        
+
         # Only return active sessions if requested
         if active_only == 'true':
             from django.utils import timezone
@@ -386,7 +752,7 @@ class TestSessionViewSet(viewsets.ModelViewSet):
                 is_expired=False,
                 expires_at__gt=now
             )
-            
+
         return queryset
 
     @action(detail=False, methods=['post'])
@@ -395,37 +761,41 @@ class TestSessionViewSet(viewsets.ModelViewSet):
         test_id = request.data.get('test_id')
         if not test_id:
             return Response({'error': 'test_id is required'}, status=status.HTTP_400_BAD_REQUEST)
-        
+
         try:
             test = Test.objects.get(id=test_id, is_active=True)
         except Test.DoesNotExist:
             return Response({'error': 'Test not found or inactive'}, status=status.HTTP_404_NOT_FOUND)
-        
+
+        # Check if student can access this test (same admin isolation)
+        if request.user.created_by_admin and test.teacher.created_by_admin != request.user.created_by_admin:
+            return Response({'error': 'Siz faqat o\'z adminingizning testlarida qatnasha olasiz'}, status=status.HTTP_403_FORBIDDEN)
+
         # Check if student already has an attempt for this test
         existing_attempt = TestAttempt.objects.filter(student=request.user, test=test).first()
         if existing_attempt:
             return Response({'error': 'Test already completed'}, status=status.HTTP_400_BAD_REQUEST)
-        
+
         # Check for existing active session
         existing_session = TestSession.objects.filter(
-            student=request.user, 
-            test=test, 
+            student=request.user,
+            test=test,
             is_completed=False,
             is_expired=False
         ).first()
-        
+
         if existing_session:
             # Return existing session
             serializer = self.get_serializer(existing_session)
             return Response(serializer.data)
-        
+
         # Create new session
         from django.utils import timezone
         import uuid
-        
+
         now = timezone.now()
         expires_at = now + timezone.timedelta(minutes=test.time_limit)
-        
+
         session = TestSession.objects.create(
             session_id=str(uuid.uuid4()),
             test=test,
@@ -434,7 +804,7 @@ class TestSessionViewSet(viewsets.ModelViewSet):
             expires_at=expires_at,
             answers={}
         )
-        
+
         serializer = self.get_serializer(session)
         return Response(serializer.data, status=status.HTTP_201_CREATED)
 
@@ -507,6 +877,11 @@ class TestSessionViewSet(viewsets.ModelViewSet):
             if session.is_completed:
                 return Response({'error': 'Test already completed'}, status=status.HTTP_400_BAD_REQUEST)
 
+            # Check if attempt already exists for this student and test
+            existing_attempt = TestAttempt.objects.filter(student=session.student, test=session.test).first()
+            if existing_attempt:
+                return Response({'error': 'Test attempt already exists'}, status=status.HTTP_400_BAD_REQUEST)
+
             # Check if session has expired
             is_expired = session.is_expired or session.time_remaining <= 0
             if is_expired and not session.is_expired:
@@ -560,159 +935,7 @@ class TestSessionViewSet(viewsets.ModelViewSet):
         except TestSession.DoesNotExist:
             return Response({'error': 'Session not found'}, status=status.HTTP_404_NOT_FOUND)
 
-class GiftViewSet(viewsets.ModelViewSet):
-    queryset = Gift.objects.all()
-    serializer_class = GiftSerializer
-    permission_classes = [IsAuthenticated]
-
-    def get_permissions(self):
-        """Only allow admin and seller to manage gifts"""
-        if self.action in ['create', 'update', 'partial_update', 'destroy']:
-            return [IsAuthenticated()]
-        return [AllowAny()]
-
-    def get_queryset(self):
-        """Only return active gifts for non-admin users"""
-        if self.request.user.role in ['admin', 'seller']:
-            return Gift.objects.all()
-        return Gift.objects.filter(is_active=True)
-
-    def perform_create(self, serializer):
-        if self.request.user.role not in ['admin', 'seller']:
-            from rest_framework.exceptions import PermissionDenied
-            raise PermissionDenied("Only admin and seller can manage gifts")
-        return serializer.save()
-
-    def perform_update(self, serializer):
-        if self.request.user.role not in ['admin', 'seller']:
-            from rest_framework.exceptions import PermissionDenied
-            raise PermissionDenied("Only admin and seller can manage gifts")
-        return serializer.save()
-
-    def perform_destroy(self, instance):
-        if self.request.user.role not in ['admin', 'seller']:
-            from rest_framework.exceptions import PermissionDenied
-            raise PermissionDenied("Only admin and seller can manage gifts")
         instance.delete()
-
-class StudentGiftViewSet(viewsets.ModelViewSet):
-    queryset = StudentGift.objects.all()
-    serializer_class = StudentGiftSerializer
-    permission_classes = [IsAuthenticated]
-
-    def get_queryset(self):
-        queryset = StudentGift.objects.all()
-        student = self.request.query_params.get('student', None)
-        if student:
-            queryset = queryset.filter(student_id=student)
-        return queryset
-
-    @action(detail=False, methods=['post'])
-    def purchase_gift(self, request):
-        """Student purchases a gift with stars"""
-        gift_id = request.data.get('gift_id')
-        if not gift_id:
-            return Response({'error': 'gift_id is required'}, status=status.HTTP_400_BAD_REQUEST)
-
-        try:
-            gift = Gift.objects.get(id=gift_id, is_active=True)
-        except Gift.DoesNotExist:
-            return Response({'error': 'Gift not found or inactive'}, status=status.HTTP_404_NOT_FOUND)
-
-        student = request.user
-        if student.role != 'student':
-            return Response({'error': 'Only students can purchase gifts'}, status=status.HTTP_403_FORBIDDEN)
-
-        if student.stars < gift.star_cost:
-            return Response({'error': 'Not enough stars to purchase this gift'}, status=status.HTTP_400_BAD_REQUEST)
-
-        # Deduct stars and create purchase record
-        student.stars -= gift.star_cost
-        student.save()
-
-        # Find the first available position (1, 2, or 3)
-        placed_positions = StudentGift.objects.filter(
-            student=student,
-            is_placed=True
-        ).values_list('placement_position', flat=True)
-
-        available_position = None
-        for pos in [1, 2, 3]:
-            if pos not in placed_positions:
-                available_position = pos
-                break
-
-        # Create the gift and place it if there's an available position
-        student_gift = StudentGift.objects.create(
-            student=student,
-            gift=gift,
-            is_placed=available_position is not None,
-            placement_position=available_position
-        )
-
-        serializer = self.get_serializer(student_gift)
-        return Response({
-            'message': 'Gift purchased successfully',
-            'student_gift': serializer.data,
-            'remaining_stars': student.stars
-        })
-
-    @action(detail=True, methods=['post'])
-    def place_gift(self, request, pk=None):
-        """Place or remove a gift on student's profile"""
-        student_gift = self.get_object()
-        if student_gift.student != request.user:
-            return Response({'error': 'You can only manage your own gifts'}, status=status.HTTP_403_FORBIDDEN)
-
-        position = request.data.get('position')  # 1, 2, or 3, or null to remove
-
-        if position is not None:
-            if position not in [1, 2, 3]:
-                return Response({'error': 'Position must be 1, 2, or 3'}, status=status.HTTP_400_BAD_REQUEST)
-
-            # Check if position is already taken
-            existing = StudentGift.objects.filter(
-                student=request.user,
-                placement_position=position,
-                is_placed=True
-            ).exclude(id=student_gift.id).first()
-
-            if existing:
-                return Response({'error': f'Position {position} is already occupied'}, status=status.HTTP_400_BAD_REQUEST)
-
-        # Update placement
-        student_gift.is_placed = position is not None
-        student_gift.placement_position = position
-        student_gift.save()
-
-        serializer = self.get_serializer(student_gift)
-        message = f'Gift placed at position {position}' if position is not None else 'Gift removed from profile'
-        return Response({
-            'message': message,
-            'student_gift': serializer.data
-        })
-
-    @action(detail=False, methods=['get'], permission_classes=[AllowAny])
-    def my_gifts(self, request):
-        """Get user's gifts"""
-        student_id = request.query_params.get('student')
-        if not student_id:
-            student_id = request.user.id
-        gifts = StudentGift.objects.filter(student_id=student_id)
-        serializer = self.get_serializer(gifts, many=True)
-        return Response(serializer.data)
-
-    @action(detail=False, methods=['get'])
-    def placed_gifts(self, request):
-        """Get gifts placed on current user's profile"""
-        gifts = StudentGift.objects.filter(
-            student=request.user,
-            is_placed=True
-        ).order_by('placement_position')
-        serializer = self.get_serializer(gifts, many=True)
-        return Response(serializer.data)
-
-
 
 class PricingViewSet(viewsets.ModelViewSet):
     queryset = Pricing.objects.all()
@@ -723,25 +946,27 @@ class PricingViewSet(viewsets.ModelViewSet):
         """Only allow admin and seller to manage pricing"""
         if self.action in ['create', 'update', 'partial_update', 'destroy']:
             return [IsAuthenticated()]
+        # Allow public access for list and retrieve
         return [AllowAny()]
 
     def get_queryset(self):
-        """Only return active pricing for non-admin users"""
-        if self.request.user.role in ['admin', 'seller']:
+        """Only return active pricing plans for non-admin users"""
+        if self.request.user.is_authenticated and self.request.user.role in ['admin', 'seller', 'head_admin']:
             return Pricing.objects.all()
+        # For unauthenticated users, only return active pricing plans
         return Pricing.objects.filter(is_active=True)
 
     def perform_create(self, serializer):
         if self.request.user.role not in ['admin', 'seller']:
             from rest_framework.exceptions import PermissionDenied
             raise PermissionDenied("Only admin and seller can manage pricing")
-        serializer.save()
+        return serializer.save()
 
     def perform_update(self, serializer):
         if self.request.user.role not in ['admin', 'seller']:
             from rest_framework.exceptions import PermissionDenied
             raise PermissionDenied("Only admin and seller can manage pricing")
-        serializer.save()
+        return serializer.save()
 
     def perform_destroy(self, instance):
         if self.request.user.role not in ['admin', 'seller']:
@@ -758,25 +983,27 @@ class StarPackageViewSet(viewsets.ModelViewSet):
         """Only allow admin and seller to manage star packages"""
         if self.action in ['create', 'update', 'partial_update', 'destroy']:
             return [IsAuthenticated()]
+        # Allow public access for list and retrieve
         return [AllowAny()]
 
     def get_queryset(self):
         """Only return active star packages for non-admin users"""
-        if self.request.user.role in ['admin', 'seller']:
+        if self.request.user.is_authenticated and self.request.user.role in ['admin', 'seller', 'head_admin']:
             return StarPackage.objects.all()
+        # For unauthenticated users, only return active star packages
         return StarPackage.objects.filter(is_active=True)
 
     def perform_create(self, serializer):
         if self.request.user.role not in ['admin', 'seller']:
             from rest_framework.exceptions import PermissionDenied
             raise PermissionDenied("Only admin and seller can manage star packages")
-        serializer.save()
+        return serializer.save()
 
     def perform_update(self, serializer):
         if self.request.user.role not in ['admin', 'seller']:
             from rest_framework.exceptions import PermissionDenied
             raise PermissionDenied("Only admin and seller can manage star packages")
-        serializer.save()
+        return serializer.save()
 
     def perform_destroy(self, instance):
         if self.request.user.role not in ['admin', 'seller']:
@@ -806,5 +1033,269 @@ class StarPackageViewSet(viewsets.ModelViewSet):
     def perform_create(self, serializer):
         # Only allow authenticated users to create sessions
         serializer.save(student=self.request.user)
+
+class ContactMessageViewSet(viewsets.ModelViewSet):
+    """ViewSet for managing contact messages"""
+    queryset = ContactMessage.objects.all()
+    permission_classes = [AllowAny]  # Allow public submission
+    
+    def get_serializer_class(self):
+        from .serializers import ContactMessageSerializer
+        return ContactMessageSerializer
+    
+    def create(self, request, *args, **kwargs):
+        """Handle contact form submission"""
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        self.perform_create(serializer)
+        
+        return Response({
+            'message': 'Xabaringiz muvaffaqiyatli yuborildi! Biz tez orada javob beramiz.',
+            'data': serializer.data
+        }, status=status.HTTP_201_CREATED)
+    
+    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated])
+    def admin_list(self, request):
+        """List messages for admin users (head admin only)"""
+        if request.user.role != 'head_admin':
+            return Response({'error': 'Faqat super admin xabarlarni ko\'ra oladi'}, status=status.HTTP_403_FORBIDDEN)
+        
+        queryset = self.get_queryset()
+        
+        # Filter by status if provided
+        status = request.query_params.get('status', None)
+        if status:
+            queryset = queryset.filter(status=status)
+        
+        # Filter by subject if provided
+        subject = request.query_params.get('subject', None)
+        if subject:
+            queryset = queryset.filter(subject=subject)
+        
+        # Search by name, email, or message content
+        search = request.query_params.get('search', None)
+        if search:
+            queryset = queryset.filter(
+                models.Q(name__icontains=search) |
+                models.Q(email__icontains=search) |
+                models.Q(message__icontains=search)
+            )
+        
+        serializer = self.get_serializer(queryset, many=True)
+        return Response(serializer.data)
+    
+    @action(detail=True, methods=['patch'], permission_classes=[IsAuthenticated])
+    def update_status(self, request, pk=None):
+        """Update message status (head admin only)"""
+        if request.user.role != 'head_admin':
+            return Response({'error': 'Faqat super admin statusni o\'zgartira oladi'}, status=status.HTTP_403_FORBIDDEN)
+        
+        message = self.get_object()
+        new_status = request.data.get('status')
+        admin_reply = request.data.get('admin_reply', '')
+        
+        if new_status not in ['new', 'read', 'replied', 'closed']:
+            return Response({'error': 'Noto\'g\'ri status'}, status=status.HTTP_400_BAD_REQUEST)
+        
+        message.status = new_status
+        if admin_reply:
+            message.admin_reply = admin_reply
+            message.replied_by = request.user
+            from django.utils import timezone
+            message.replied_at = timezone.now()
+        
+        message.save()
+        
+        serializer = self.get_serializer(message)
+        return Response({
+            'message': 'Xabar holati yangilandi',
+            'data': serializer.data
+        })
+    
+    @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated])
+    def reply(self, request, pk=None):
+        """Reply to a contact message (head admin only)"""
+        if request.user.role != 'head_admin':
+            return Response({'error': 'Faqat super admin javob bera oladi'}, status=status.HTTP_403_FORBIDDEN)
+        
+        message = self.get_object()
+        admin_reply = request.data.get('admin_reply', '')
+        
+        if not admin_reply:
+            return Response({'error': 'Javob matni kerak'}, status=status.HTTP_400_BAD_REQUEST)
+        
+        message.admin_reply = admin_reply
+        message.replied_by = request.user
+        message.status = 'replied'
+        from django.utils import timezone
+        message.replied_at = timezone.now()
+        message.save()
+        
+        # Send email notification to user
+        email_sent = self._send_reply_email(message, admin_reply)
+        
+        serializer = self.get_serializer(message)
+        return Response({
+            'message': 'Javob yuborildi' + (' va email yuborildi' if email_sent else ''),
+            'email_sent': email_sent,
+            'data': serializer.data
+        })
+    
+    def _send_reply_email(self, message, admin_reply):
+        """Send email notification to user when admin replies"""
+        try:
+            # Import Django email functionality
+            from django.core.mail import send_mail
+            from django.template.loader import render_to_string
+            from django.utils.html import strip_tags
+            from django.conf import settings
+            
+            # Prepare email content
+            subject = f'Reply to your message: {message.get_subject_display()}'
+            
+            # Create HTML email content
+            html_content = f"""
+            <html>
+            <body style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; background-color: #f8fafc;">
+                <div style="background: white; padding: 30px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1);">
+                    <h2 style="color: #135bec; margin-bottom: 20px;">Javob xabaringiz bor!</h2>
+                    
+                    <p>Assalomu alaykum <strong>{message.name}</strong>,</p>
+                    
+                    <p>Sizning "<strong>{message.get_subject_display()}</strong>" mavzusidagi xabaringizga javob berildi:</p>
+                    
+                    <div style="background: #f8fafc; padding: 20px; border-radius: 8px; border-left: 4px solid #135bec; margin: 20px 0;">
+                        <h4 style="margin: 0 0 10px 0; color: #374151;">Sizning xabaringiz:</h4>
+                        <p style="margin: 0; color: #6b7280;">{message.message}</p>
+                    </div>
+                    
+                    <div style="background: #e0f2fe; padding: 20px; border-radius: 8px; border-left: 4px solid #0ea5e9; margin: 20px 0;">
+                        <h4 style="margin: 0 0 10px 0; color: #0369a1;">Admin javobi:</h4>
+                        <p style="margin: 0; color: #0c4a6e;">{admin_reply}</p>
+                    </div>
+                    
+                    <div style="margin-top: 30px; padding-top: 20px; border-top: 1px solid #e5e7eb;">
+                        <p style="color: #6b7280; font-size: 14px; margin: 0;">
+                            Javob bergan: {message.replied_by.name if message.replied_by else 'Admin'}<br>
+                            Sana: {message.replied_at.strftime('%Y-%m-%d %H:%M') if message.replied_at else ''}
+                        </p>
+                    </div>
+                    
+                    <div style="margin-top: 30px; padding: 20px; background: #f0f9ff; border-radius: 8px; text-align: center;">
+                        <p style="margin: 0; color: #0369a1; font-weight: 600;">Examify - Sergeli ixtisoslashtirilgan maktab</p>
+                        <p style="margin: 5px 0 0 0; color: #6b7280; font-size: 14px;">Professional ta'lim platformasi</p>
+                    </div>
+                </div>
+            </body>
+            </html>
+            """
+            
+            # Create plain text version
+            plain_message = f"""
+Javob xabaringiz bor!
+
+Assalomu alaykum {message.name},
+
+Sizning "{message.get_subject_display()}" mavzusidagi xabaringizga javob berildi:
+
+Sizning xabaringiz:
+{message.message}
+
+Admin javobi:
+{admin_reply}
+
+Javob bergan: {message.replied_by.name if message.replied_by else 'Admin'}
+Sana: {message.replied_at.strftime('%Y-%m-%d %H:%M') if message.replied_at else ''}
+
+Examify - Sergeli ixtisoslashtirilgan maktab
+Professional ta'lim platformasi
+            """
+            
+            # Send email
+            send_mail(
+                subject=subject,
+                message=plain_message,
+                from_email=settings.DEFAULT_FROM_EMAIL or 'noreply@examify.uz',
+                recipient_list=[message.email],
+                html_message=html_content,
+                fail_silently=False
+            )
+            
+            print(f"Email sent successfully to {message.email}")
+            return True
+            
+        except Exception as e:
+            print(f"Failed to send email: {e}")
+            # Don't fail the main operation if email fails
+            return False
+    
+    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated])
+    def my_messages(self, request):
+        """Get user's own contact messages"""
+        if not request.user.email:
+            return Response({'error': 'Email manzili kerak'}, status=status.HTTP_400_BAD_REQUEST)
+        
+        # Get messages by email (since users don't need to be logged in to send messages)
+        queryset = ContactMessage.objects.filter(email=request.user.email).order_by('-created_at')
+        
+        serializer = self.get_serializer(queryset, many=True)
+        return Response(serializer.data)
+    
+    @action(detail=True, methods=['put'], permission_classes=[IsAuthenticated])
+    def edit_message(self, request, pk=None):
+        """Edit user's own contact message (only if not replied yet)"""
+        if not request.user.email:
+            return Response({'error': 'Email manzili kerak'}, status=status.HTTP_400_BAD_REQUEST)
+        
+        try:
+            message = ContactMessage.objects.get(id=pk, email=request.user.email)
+        except ContactMessage.DoesNotExist:
+            return Response({'error': 'Xabar topilmadi'}, status=status.HTTP_404_NOT_FOUND)
+        
+        # Check if message has already been replied to
+        if message.status == 'replied':
+            return Response({'error': 'Javob berilgan xabarni tahrirlab bo\'lmaydi'}, status=status.HTTP_400_BAD_REQUEST)
+        
+        # Only allow editing name, phone, subject, and message (not email)
+        name = request.data.get('name')
+        phone = request.data.get('phone')
+        subject = request.data.get('subject')
+        message_text = request.data.get('message')
+        
+        if name:
+            message.name = name
+        if phone is not None:
+            message.phone = phone
+        if subject:
+            message.subject = subject
+        if message_text:
+            message.message = message_text
+        
+        message.save()
+        
+        serializer = self.get_serializer(message)
+        return Response({
+            'message': 'Xabar muvaffaqiyatli yangilandi',
+            'data': serializer.data
+        })
+    
+    @action(detail=True, methods=['delete'], permission_classes=[IsAuthenticated])
+    def delete_message(self, request, pk=None):
+        """Delete user's own contact message (only if not replied yet)"""
+        if not request.user.email:
+            return Response({'error': 'Email manzili kerak'}, status=status.HTTP_400_BAD_REQUEST)
+        
+        try:
+            message = ContactMessage.objects.get(id=pk, email=request.user.email)
+        except ContactMessage.DoesNotExist:
+            return Response({'error': 'Xabar topilmadi'}, status=status.HTTP_404_NOT_FOUND)
+        
+        # Check if message has already been replied to
+        if message.status == 'replied':
+            return Response({'error': 'Javob berilgan xabarni o\'chirib bo\'lmaydi'}, status=status.HTTP_400_BAD_REQUEST)
+        
+        message.delete()
+        
+        return Response({'message': 'Xabar muvaffaqiyatli o\'chirildi'})
 
 
